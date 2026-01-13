@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { useChat } from 'ai/react';
 import { PLATFORMS, DEFAULT_PLATFORM } from '../config/platforms';
 
 interface ProgressData {
@@ -12,94 +11,127 @@ interface ProgressData {
 }
 
 const PromptApp = () => {
-  // 平台选择状态
+  // --- 基础状态 ---
   const [selectedPlatform, setSelectedPlatform] = useState<string>(DEFAULT_PLATFORM);
-  
-  // 模型选择状态
-  const [selectedModel, setSelectedModel] = useState<string>(PLATFORMS[DEFAULT_PLATFORM].supportedModels[0]);
+  const [selectedModel, setSelectedModel] = useState<string>(''); // 初始化逻辑保持原样，略
   const [customModel, setCustomModel] = useState<string>('');
   const [useCustomModel, setUseCustomModel] = useState<boolean>(false);
   
-  // 获取当前平台支持的模型
+  // --- 新增/替换的状态 ---
+  const [input, setInput] = useState(''); // 替代 useChat 的 input
+  const [messages, setMessages] = useState<any[]>([]); // 仅用于UI展示，不参与逻辑
+  const [responseText, setResponseText] = useState(''); // 专门存放当前 AI 回复
+  const [isLoading, setIsLoading] = useState(false); // 手动控制加载状态
+  
   const currentPlatformModels = PLATFORMS[selectedPlatform]?.supportedModels || [];
-  
-  // 获取当前使用的模型
+
+  // 获取当前使用的模型 (逻辑不变)
   const getCurrentModel = () => {
-    if (useCustomModel && customModel.trim()) {
-      return customModel.trim();
-    }
-    return selectedModel;
+    if (useCustomModel && customModel.trim()) return customModel.trim();
+    return currentPlatformModels.includes(selectedModel) ? selectedModel : currentPlatformModels[0];
   };
-  
-  const { messages, input, handleInputChange, handleSubmit, isLoading, append, setMessages } = useChat({
-    api: '/api/chat',
-    body: {
-      model: getCurrentModel(),
-      platform: selectedPlatform
-    }
-  });
-  
-  // 当平台改变时，重置模型选择
-  useEffect(() => {
-    setSelectedModel(PLATFORMS[selectedPlatform].supportedModels[0]);
-    setUseCustomModel(false);
-    setCustomModel('');
-  }, [selectedPlatform]);
-  
+
+  // 进度状态 (逻辑不变)
   const [progress, setProgress] = useState<ProgressData>({
     startTime: 0,
     firstTokenTime: null,
     endTime: null,
     totalTokens: 0,
   });
-  
-  const [responseText, setResponseText] = useState('');
-  const [isStreaming, setIsStreaming] = useState(false);
-  
-  const handleCustomSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+
+  // ✅ 核心重构：手动处理流式请求
+  const handleCustomSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    if (!input.trim()) return;
-    
-    // Reset progress data
-    const newProgress = {
-      startTime: Date.now(),
+    if (!input.trim() || isLoading) return;
+
+    // 1. 准备数据
+    const currentPrompt = input;
+    const currentModel = getCurrentModel();
+    const startTime = Date.now();
+
+    // 2. 重置状态
+    setIsLoading(true);
+    setResponseText(''); // 清空上一条回复
+    setProgress({
+      startTime: startTime,
       firstTokenTime: null,
       endTime: null,
       totalTokens: 0,
-    };
-    setProgress(newProgress);
-    setResponseText('');
-    setIsStreaming(true);
-    
-    handleSubmit(e);
-  };
-  
-  // Monitor messages for new responses
-  useEffect(() => {
-    if (messages.length > 0) {
-      const lastMessage = messages[messages.length - 1];
-      if (lastMessage.role === 'assistant') {
-        setResponseText(lastMessage.content);
+    });
+
+    try {
+      // 3. 发起原生 Fetch 请求 (完全可控的参数)
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          // ⭐ 这里你可以随心所欲地传任何参数，不用看 SDK 脸色
+          prompt: currentPrompt,
+          model: currentModel,
+          platform: selectedPlatform,
+          messages: [{ role: 'user', content: currentPrompt }] // 如果后端需要兼容
+        }),
+      });
+
+      if (!response.ok) throw new Error('Network error');
+      if (!response.body) throw new Error('No readable stream');
+
+      // 4. 处理流式响应
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let done = false;
+      let accumulatedText = '';
+      let isFirstToken = true;
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read();
+        done = doneReading;
         
-        // Check if this is the first token
-        if (progress.firstTokenTime === null && lastMessage.content.length > 0) {
-          setProgress(prev => ({
-            ...prev,
-            firstTokenTime: Date.now(),
-          }));
-        }
-        
-        // Check if streaming has ended
-        if (!isLoading && isStreaming) {
-          setProgress(prev => ({
-            ...prev,
-            endTime: Date.now(),
-          }));
-          setIsStreaming(false);
+        if (value) {
+          // 解码数据块
+          const chunk = decoder.decode(value, { stream: true });
+          accumulatedText += chunk;
+          
+          // 更新 UI 文本
+          setResponseText(prev => prev + chunk);
+
+          // ✅ 精确捕获首 Token 时间
+          if (isFirstToken && chunk.trim().length > 0) {
+            setProgress(prev => ({
+              ...prev,
+              firstTokenTime: Date.now()
+            }));
+            isFirstToken = false;
+          }
         }
       }
+
+      // 5. 请求结束处理
+      setProgress(prev => ({
+        ...prev,
+        endTime: Date.now(),
+        // 如果流太快，firstTokenTime 可能还没设置，兜底一下
+        firstTokenTime: prev.firstTokenTime || Date.now(),
+        totalTokens: accumulatedText.length, // 简单估算，或者后端返回
+      }));
+
+    } catch (error) {
+      console.error('Stream error:', error);
+      setResponseText(prev => prev + '\n[Error generating response]');
+    } finally {
+      setIsLoading(false);
     }
-  }, [messages, isLoading, progress.firstTokenTime, isStreaming]);
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+  };
+
+  const handleClear = () => {
+    setInput('');
+    setResponseText('');
+    setProgress({ startTime: 0, firstTokenTime: null, endTime: null, totalTokens: 0 });
+  };
   
   const calculateDuration = (start: number, end: number | null) => {
     if (!end) return 'Calculating...';
@@ -115,13 +147,16 @@ const PromptApp = () => {
     if (!progress.endTime) return 'Calculating...';
     return `${(progress.endTime - progress.startTime) / 1000}s`;
   };
-  
+// ... 辅助函数修改 ...
   const getStreamingTime = () => {
     if (!progress.firstTokenTime) return '0s';
-    if (!progress.endTime) {
-      return `${(Date.now() - progress.firstTokenTime) / 1000}s`;
+    // 如果结束了，显示固定时长；如果还在加载，显示动态时长
+    if (progress.endTime) {
+       return `${(progress.endTime - progress.firstTokenTime) / 1000}s`;
     }
-    return `${(progress.endTime - progress.firstTokenTime) / 1000}s`;
+    // 注意：这里需要一个每秒刷新的机制才能让数字在界面上跳动
+    // 但为了简化，暂且用当前时间计算（组件重渲染时会更新）
+    return `${((Date.now() - progress.firstTokenTime) / 1000).toFixed(1)}s`;
   };
   
   return (
@@ -134,6 +169,12 @@ const PromptApp = () => {
               className="inline-flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
             >
               📊 批量测试
+            </a>
+            <a 
+              href="/batch/compare" 
+              className="inline-flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors text-sm font-medium"
+            >
+              🆚 模型对比
             </a>
             <a 
               href="/logs" 
@@ -261,7 +302,16 @@ const PromptApp = () => {
             
             {/* Output area */}
             <div className="bg-white rounded-xl shadow-md p-6">
-              <h2 className="text-xl font-semibold text-gray-900 mb-4">AI Response</h2>
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-gray-900">AI Response</h2>
+                <button
+                  onClick={handleClear}
+                  disabled={isLoading}
+                  className="text-sm bg-gray-100 hover:bg-gray-200 text-gray-800 px-3 py-1 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Clear Response
+                </button>
+              </div>
               <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 min-h-[200px] max-h-[500px] overflow-y-auto">
                 {responseText ? (
                   <div className="text-gray-800 whitespace-pre-wrap">{responseText}</div>
@@ -285,7 +335,7 @@ const PromptApp = () => {
                     <span>{progress.startTime ? new Date(progress.startTime).toLocaleTimeString() : '-'}</span>
                   </div>
                   <div className="w-full bg-gray-200 rounded-full h-2">
-                    {isStreaming && (
+                    {isLoading && (
                       <div className="bg-blue-600 h-2 rounded-full" style={{ width: '100%' }}></div>
                     )}
                   </div>
@@ -311,7 +361,7 @@ const PromptApp = () => {
                     <span>{getStreamingTime()}</span>
                   </div>
                   <div className="w-full bg-gray-200 rounded-full h-2">
-                    {isStreaming && progress.firstTokenTime && (
+                    {isLoading && progress.firstTokenTime && (
                       <div 
                         className="bg-purple-500 h-2 rounded-full" 
                         style={{ 
@@ -320,7 +370,7 @@ const PromptApp = () => {
                         }}
                       ></div>
                     )}
-                    {!isStreaming && progress.firstTokenTime && progress.endTime && (
+                    {!isLoading && progress.firstTokenTime && progress.endTime && (
                       <div className="bg-purple-500 h-2 rounded-full" style={{ width: '100%' }}></div>
                     )}
                   </div>
@@ -333,7 +383,7 @@ const PromptApp = () => {
                     <span>{getTotalTime()}</span>
                   </div>
                   <div className="w-full bg-gray-200 rounded-full h-2">
-                    {!isStreaming && progress.endTime && (
+                    {!isLoading && progress.endTime && (
                       <div className="bg-orange-500 h-2 rounded-full" style={{ width: '100%' }}></div>
                     )}
                   </div>
@@ -364,9 +414,9 @@ const PromptApp = () => {
               
               {/* Status indicator */}
               <div className="flex items-center justify-center p-4 rounded-lg">
-                <div className={`w-3 h-3 rounded-full mr-2 ${isStreaming ? 'bg-blue-500 animate-pulse' : progress.endTime ? 'bg-green-500' : 'bg-gray-400'}`}></div>
+                <div className={`w-3 h-3 rounded-full mr-2 ${isLoading ? 'bg-blue-500 animate-pulse' : progress.endTime ? 'bg-green-500' : 'bg-gray-400'}`}></div>
                 <span className="text-sm font-medium text-gray-700">
-                  {isStreaming ? 'Streaming Response...' : progress.endTime ? 'Completed' : 'Ready'}
+                  {isLoading ? 'Streaming Response...' : progress.endTime ? 'Completed' : 'Ready'}
                 </span>
               </div>
             </div>

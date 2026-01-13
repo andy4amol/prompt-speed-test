@@ -1,7 +1,21 @@
 import OpenAI from 'openai';
 import { StreamingTextResponse } from 'ai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { logger } from '../../../utils/logger';
 import { PLATFORMS, DEFAULT_PLATFORM } from '../../../config/platforms';
+import { ProxyAgent, setGlobalDispatcher } from "undici";
+// --- 代理配置核心代码 START ---
+const PROXY_URL = process.env.HTTPS_PROXY || 'http://127.0.0.1:8118'; // 你的代理地址
+// 仅在开发环境或显式配置了代理时启用，避免影响线上生产环境
+if (process.env.NODE_ENV === 'development' || process.env.HTTPS_PROXY) {
+  try {
+    const dispatcher = new ProxyAgent(PROXY_URL);
+    setGlobalDispatcher(dispatcher);
+    console.log(`[Proxy] Global dispatcher set to ${PROXY_URL}`);
+  } catch (error) {
+    console.error('[Proxy] Failed to set global dispatcher:', error);
+  }
+}
 
 export async function POST(req: Request) {
   // 记录请求开始时间
@@ -12,7 +26,7 @@ export async function POST(req: Request) {
   try {
     // 解析请求体
     const body = await req.json();
-    
+    console.log('openai', body);
     // 提取用户输入
     let userPrompt = '';
     
@@ -59,25 +73,96 @@ export async function POST(req: Request) {
       });
     }
     
-    // 初始化 OpenAI 客户端（兼容模式）
-    const openai = new OpenAI({
-      apiKey: apiKey,
-      baseURL: platform.baseUrl,
-    });
-    
     // 使用请求中指定的模型或默认模型（根据平台）
     const defaultModel = platform.supportedModels[0] || 'qwen-flash';
     const modelName = body.model || defaultModel;
     
-    // 调用 AI 平台 API
-    const completionStream = await openai.chat.completions.create({
-      model: modelName,
-      messages: [
-        { role: 'user', content: userPrompt }
-      ],
-      stream: true,
-      temperature: 0.7,
-    });
+    let completionStream;
+    if (platform.type === 'gemini') {
+       // 1. 初始化 GoogleGenerativeAI 客户端 (注意类名变化)
+      const genAI = new GoogleGenerativeAI(apiKey);
+      
+      // 2. 获取模型实例
+      const model = genAI.getGenerativeModel({ model: modelName });
+      
+      // 3. 调用流式接口 (注意这里是 generateContentStream)
+      const result = await model.generateContentStream(userPrompt);
+      
+          // 4. 转换为与 OpenAI 兼容的流格式
+      completionStream = {
+        [Symbol.asyncIterator]: async function* () {
+          let isFirstChunk = true;
+          
+          // 注意：Google SDK 返回的 result 包含一个 stream 属性用于迭代
+          for await (const chunk of result.stream) {
+            let content = '';
+            
+            // --- 健壮的文本提取逻辑 ---
+            try {
+              // 标准提取方式：调用 .text() 方法
+              if (typeof chunk.text === 'function') {
+                content = chunk.text();
+              } 
+              // 某些特殊情况或旧版本：访问 .text 属性
+              else if (typeof chunk.text === 'string') {
+                content = chunk.text;
+              }
+            } catch (e) {
+              // Google SDK 在遇到安全拦截(Safety Ratings)时，调用 .text() 会抛错
+              // 这里捕获错误，防止整个流中断
+              console.warn('Gemini chunk text extraction skipped:', e);
+            }
+            // ------------------------
+
+            if (content) {
+              // 记录首 token 时间
+              if (isFirstChunk) {
+                firstTokenTime = Date.now();
+                isFirstChunk = false;
+              }
+              
+              // 拼接完整响应
+              fullResponse += content;
+              
+              // 构造 OpenAI 格式的 chunk
+              yield {
+                choices: [{
+                  delta: {
+                    content: content
+                  },
+                  finish_reason: null
+                }]
+              };
+            }
+          }
+          
+          // 流结束标记
+          yield {
+            choices: [{
+              delta: {},
+              finish_reason: 'stop'
+            }]
+          };
+        }
+      };
+    } else {
+      // OpenAI 兼容平台处理
+      // 初始化 OpenAI 客户端（兼容模式）
+      const openai = new OpenAI({
+        apiKey: apiKey,
+        baseURL: platform.baseUrl,
+      });
+      
+      // 调用 AI 平台 API，使用流式
+      completionStream = await openai.chat.completions.create({
+        model: modelName,
+        messages: [
+          { role: 'user', content: userPrompt }
+        ],
+        stream: true,
+        temperature: 0.7,
+      });
+    }
     
     // 转换为 ReadableStream
     const stream = new ReadableStream({
@@ -86,7 +171,7 @@ export async function POST(req: Request) {
         
         try {
           // 遍历流数据
-          for await (const chunk of completionStream) {
+          for await (const chunk of completionStream as any) {
             const content = chunk.choices[0]?.delta?.content || '';
             if (content) {
               // 记录首 token 时间
@@ -142,6 +227,8 @@ export async function POST(req: Request) {
     });
     
     // 使用 StreamingTextResponse 包装，确保与 useChat 兼容
+    // 注意：由于是流式响应，我们无法直接返回metrics数据
+    // 前端需要通过其他方式获取准确的metrics
     return new StreamingTextResponse(stream);
     
   } catch (error: any) {
